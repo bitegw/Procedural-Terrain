@@ -7,6 +7,10 @@ struct Triangle {
     float3 vertexC;
     float3 vertexB;
     float3 vertexA;
+
+	float3 normC;
+    float3 normB;
+    float3 normA;
 };
 
 AppendStructuredBuffer<Triangle> triangles;
@@ -14,6 +18,7 @@ RWStructuredBuffer<float4> points;
 
 int numPointsPerAxis;
 float isoLevel;
+float spacing;
 
 float3 interpolateVerts(float4 v1, float4 v2) {
     float t = (isoLevel - v1.w) / (v2.w - v1.w);
@@ -23,11 +28,33 @@ float3 interpolateVerts(float4 v1, float4 v2) {
 int indexFromCoord(int x, int y, int z) {
     return z * numPointsPerAxis * numPointsPerAxis + y * numPointsPerAxis + x;
 }
+
+float distAlongEdge(float3 p, float3 o){
+	return distance(p, o) / spacing;
+}
+
+float3 gradNormal(int3 p1, int3 p2, float t){
+	//Based on GPU Gems section 1.4 example 1-1,
+	//https://developer.nvidia.com/gpugems/gpugems3/part-i-geometry/chapter-1-generating-complex-procedural-terrains-using-gpu 
+	//If we were using a noise function directly the normal calculation could be done by sampling nearby noise 
+	//(offset by some small delta value like in the example), but because we are working with a point cloud the 
+	//closest samples we can get are the verts connected corners, so we calculate normals for those and then 
+	//lerp between them based on how far along the vert is  to get the approximate normal for our vert
+	float3 norm;
+	norm.x = lerp(points[indexFromCoord(p1.x + 1, p1.y, p1.z)].w - points[indexFromCoord(p1.x - 1, p1.y, p1.z)].w,
+				  points[indexFromCoord(p2.x + 1, p2.y, p2.z)].w - points[indexFromCoord(p2.x - 1, p2.y, p2.z)].w, t);
+	norm.y = lerp(points[indexFromCoord(p1.x, p1.y + 1, p1.z)].w - points[indexFromCoord(p1.x, p1.y - 1, p1.z)].w,
+				  points[indexFromCoord(p2.x, p2.y + 1, p2.z)].w - points[indexFromCoord(p2.x, p2.y - 1, p2.z)].w, t);
+	norm.z = lerp(points[indexFromCoord(p1.x, p1.y, p1.z + 1)].w - points[indexFromCoord(p1.x, p1.y, p1.z - 1)].w,
+				  points[indexFromCoord(p2.x, p2.y, p2.z + 1)].w - points[indexFromCoord(p2.x, p2.y, p2.z - 1)].w, t);
+	return -normalize(norm);
+}
+
 [numthreads(numThreads,numThreads,numThreads)]
 void March (int3 id : SV_DispatchThreadID)
 {   
-    // Stop one point before the end because voxel includes neighbouring points
-    if (id.x >= numPointsPerAxis-1 || id.y >= numPointsPerAxis-1 || id.z >= numPointsPerAxis-1) {
+    // Stop two points before the end, start one point after zero, because voxel includes neighbouring points and extra points for normal calculations
+    if (id.x >= numPointsPerAxis-2 || id.y >= numPointsPerAxis-2 || id.z >= numPointsPerAxis-2 || id.x <= 0 || id.y <= 0 || id.z <= 0) {
         return;
     }
 
@@ -57,23 +84,66 @@ void March (int3 id : SV_DispatchThreadID)
     if (cubeCorners[6].w < isoLevel) cubeIndex |= 64;
     if (cubeCorners[7].w < isoLevel) cubeIndex |= 128;
 
+    uint indexTriangulation[16] = {
+        (triangulation[cubeIndex][0] >> 28) & 15,
+        (triangulation[cubeIndex][0] >> 24) & 15,
+        (triangulation[cubeIndex][0] >> 20) & 15,
+        (triangulation[cubeIndex][0] >> 16) & 15,
+        (triangulation[cubeIndex][0] >> 12) & 15,
+        (triangulation[cubeIndex][0] >> 8) & 15,
+        (triangulation[cubeIndex][0] >> 4) & 15,
+        triangulation[cubeIndex][0] & 15,
+        (triangulation[cubeIndex][1] >> 28) & 15,
+        (triangulation[cubeIndex][1] >> 24) & 15,
+        (triangulation[cubeIndex][1] >> 20) & 15,
+        (triangulation[cubeIndex][1] >> 16) & 15,
+        (triangulation[cubeIndex][1] >> 12) & 15,
+        (triangulation[cubeIndex][1] >> 8) & 15,
+        (triangulation[cubeIndex][1] >> 4) & 15,
+        triangulation[cubeIndex][1] & 15
+    };
+
+	int3 cornerCoords[8] = {
+		int3(id.x, id.y, id.z),
+		int3(id.x + 1, id.y, id.z),
+		int3(id.x + 1, id.y, id.z + 1),
+		int3(id.x, id.y, id.z + 1),
+		int3(id.x, id.y + 1, id.z),
+		int3(id.x + 1, id.y + 1, id.z),
+		int3(id.x + 1, id.y + 1, id.z + 1),
+		int3(id.x, id.y + 1, id.z + 1)
+	};
+
     // Create triangles for current cube configuration
-    for (int i = 0; triangulation[cubeIndex][i] != -1; i +=3) {
+    for (int i = 0; indexTriangulation[i] != 15; i +=3) {
         // Get indices of corner points A and B for each of the three edges
         // of the cube that need to be joined to form the triangle.
-        int a0 = cornerIndexAFromEdge[triangulation[cubeIndex][i]];
-        int b0 = cornerIndexBFromEdge[triangulation[cubeIndex][i]];
+        int a0 = cornerIndexAFromEdge[indexTriangulation[i]];
+        int b0 = cornerIndexBFromEdge[indexTriangulation[i]];
 
-        int a1 = cornerIndexAFromEdge[triangulation[cubeIndex][i+1]];
-        int b1 = cornerIndexBFromEdge[triangulation[cubeIndex][i+1]];
+        int a1 = cornerIndexAFromEdge[indexTriangulation[i+1]];
+        int b1 = cornerIndexBFromEdge[indexTriangulation[i+1]];
 
-        int a2 = cornerIndexAFromEdge[triangulation[cubeIndex][i+2]];
-        int b2 = cornerIndexBFromEdge[triangulation[cubeIndex][i+2]];
+        int a2 = cornerIndexAFromEdge[indexTriangulation[i+2]];
+        int b2 = cornerIndexBFromEdge[indexTriangulation[i+2]];
 
         Triangle tri;
-        tri.vertexA = interpolateVerts(cubeCorners[a0], cubeCorners[b0]);
-        tri.vertexB = interpolateVerts(cubeCorners[a1], cubeCorners[b1]);
-        tri.vertexC = interpolateVerts(cubeCorners[a2], cubeCorners[b2]);
+		//Uncomment the lerps for classic MC with default interpolation
+        tri.vertexA = /*lerp(cubeCorners[a0], cubeCorners[b0], 0.5f);*/ interpolateVerts(cubeCorners[a0], cubeCorners[b0]);
+        tri.vertexB = /*lerp(cubeCorners[a1], cubeCorners[b1], 0.5f);*/ interpolateVerts(cubeCorners[a1], cubeCorners[b1]);
+        tri.vertexC = /*lerp(cubeCorners[a2], cubeCorners[b2], 0.5f);*/ interpolateVerts(cubeCorners[a2], cubeCorners[b2]);
+
+		//Calculate normals per vertex (gradient method)
+		tri.normA = gradNormal(cornerCoords[a0], cornerCoords[b0], distAlongEdge(tri.vertexA.xyz, cubeCorners[a0].xyz));
+		tri.normB = gradNormal(cornerCoords[a1], cornerCoords[b1], distAlongEdge(tri.vertexB.xyz, cubeCorners[a1].xyz));
+		tri.normC = gradNormal(cornerCoords[a2], cornerCoords[b2], distAlongEdge(tri.vertexC.xyz, cubeCorners[a2].xyz));
+
+		//calculate normals per triangle (low poly look)
+		/*float3 norm = normalize(cross(tri.vertexB - tri.vertexC, tri.vertexA - tri.vertexC));
+		tri.normA = norm;
+		tri.normB = norm;
+		tri.normC = norm;*/
+
         triangles.Append(tri);
     }
 

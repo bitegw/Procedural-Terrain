@@ -1,11 +1,11 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 
 [ExecuteInEditMode]
 public class MeshGenerator : MonoBehaviour
 {
-
     const int threadGroupSize = 8;
 
     [Header("General Settings")]
@@ -18,6 +18,10 @@ public class MeshGenerator : MonoBehaviour
     public Transform viewer;
     [ConditionalHide(nameof(fixedMapSize), false)]
     public float viewDistance = 30;
+
+    public List<ChunkLOD> levelsOfDetail = new List<ChunkLOD>{
+        new ChunkLOD("Full detail", 0, 50)
+    };
 
     [Space()]
     public bool autoUpdateInEditor = true;
@@ -51,10 +55,26 @@ public class MeshGenerator : MonoBehaviour
 
     bool settingsUpdated;
 
-    void Awake()
+    ChunkLOD[] levelsOrdered;
+    static ChunkLOD defaultLOD = new ChunkLOD("Default", 0, 0f);
+
+void Awake()
     {
         if (Application.isPlaying && !fixedMapSize)
         {
+            if (levelsOfDetail.Count == 0)
+            {
+                levelsOrdered = new[] { defaultLOD };
+            }
+            else
+            {
+                levelsOrdered = levelsOfDetail.OrderBy(level => -level.Distance).ToArray();
+                for (int i = 0; i < levelsOrdered.Length; i++)
+                {
+                    levelsOrdered[i].UpdateSqrDst();
+                }
+            }
+
             InitVariableChunkStructures();
 
             var oldChunks = FindObjectsOfType<Chunk>();
@@ -160,39 +180,66 @@ public class MeshGenerator : MonoBehaviour
                 {
                     Vector3Int coord = new Vector3Int(x, y, z) + viewerCoord;
 
-                    if (existingChunks.ContainsKey(coord))
-                    {
-                        continue;
-                    }
-
                     Vector3 centre = CentreFromCoord(coord);
                     Vector3 viewerOffset = p - centre;
                     Vector3 o = new Vector3(Mathf.Abs(viewerOffset.x), Mathf.Abs(viewerOffset.y), Mathf.Abs(viewerOffset.z)) - Vector3.one * boundsSize / 2;
                     float sqrDst = new Vector3(Mathf.Max(o.x, 0), Mathf.Max(o.y, 0), Mathf.Max(o.z, 0)).sqrMagnitude;
+
+                    if (existingChunks.ContainsKey(coord))
+                    {
+                        if (sqrDst <= sqrViewDistance)
+                        {
+                            foreach (ChunkLOD lod in levelsOrdered)
+                            {
+                                if (sqrDst < lod.SqrDst)
+                                    continue;
+
+                                //Update chunks that were previously loaded but now have wrong level of detail
+                                if (existingChunks[coord].lod != lod)
+                                    UpdateChunkMesh(existingChunks[coord], lod);
+
+                                break;
+                            }
+                        }
+
+                        continue;
+                    }
 
                     // Chunk is within view distance and should be created (if it doesn't already exist)
                     if (sqrDst <= sqrViewDistance)
                     {
 
                         Bounds bounds = new Bounds(CentreFromCoord(coord), Vector3.one * boundsSize);
+
                         if (IsVisibleFrom(bounds, Camera.main))
                         {
-                            if (recycleableChunks.Count > 0)
+
+                            //Find which LOD group the chunk is in
+                            foreach (ChunkLOD lod in levelsOrdered)
                             {
-                                Chunk chunk = recycleableChunks.Dequeue();
-                                chunk.coord = coord;
-                                existingChunks.Add(coord, chunk);
-                                chunks.Add(chunk);
-                                UpdateChunkMesh(chunk);
-                            }
-                            else
-                            {
-                                Chunk chunk = CreateChunk(coord);
-                                chunk.coord = coord;
-                                chunk.SetUp(mat, generateColliders);
-                                existingChunks.Add(coord, chunk);
-                                chunks.Add(chunk);
-                                UpdateChunkMesh(chunk);
+                                if (sqrDst >= lod.SqrDst)
+                                {
+                                    if (recycleableChunks.Count > 0)
+                                    {
+                                        Chunk chunk = recycleableChunks.Dequeue();
+                                        chunk.coord = coord;
+
+                                        existingChunks.Add(coord, chunk);
+                                        chunks.Add(chunk);
+                                        UpdateChunkMesh(chunk, lod);
+                                    }
+                                    else
+                                    {
+                                        Chunk chunk = CreateChunk(coord);
+                                        chunk.coord = coord;
+                                        chunk.SetUp(mat, generateColliders);
+
+                                        existingChunks.Add(coord, chunk);
+                                        chunks.Add(chunk);
+                                        UpdateChunkMesh(chunk, lod);
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
@@ -208,11 +255,14 @@ public class MeshGenerator : MonoBehaviour
         return GeometryUtility.TestPlanesAABB(planes, bounds);
     }
 
-    public void UpdateChunkMesh(Chunk chunk)
+    public void UpdateChunkMesh(Chunk chunk, ChunkLOD lod)
     {
-        int numVoxelsPerAxis = numPointsPerAxis - 3;
-        int numThreadsPerAxis = Mathf.CeilToInt(numPointsPerAxis / ((float)threadGroupSize));
-        float pointSpacing = boundsSize / (numPointsPerAxis-3);
+        int numPointsPerAxisLOD = numPointsPerAxis / (1 + lod.step);
+
+        int numVoxelsPerAxis = numPointsPerAxisLOD - 3;
+        int numThreadsPerAxis = Mathf.CeilToInt(numPointsPerAxisLOD / ((float)threadGroupSize));
+        float pointSpacing = boundsSize / (numPointsPerAxisLOD - 3);
+        chunk.lod = lod;
 
         Vector3Int coord = chunk.coord;
         Vector3 centre = CentreFromCoord(coord);
@@ -220,12 +270,12 @@ public class MeshGenerator : MonoBehaviour
         Vector3 worldBounds = new Vector3(numChunks.x, numChunks.y, numChunks.z) * boundsSize;
 
         Vector3 spacingOffset = new Vector3(pointSpacing, pointSpacing, pointSpacing);
-        densityGenerator.Generate(pointsBuffer, numPointsPerAxis, boundsSize, worldBounds, centre - spacingOffset, offset, pointSpacing);
+        densityGenerator.Generate(pointsBuffer, numPointsPerAxisLOD, boundsSize, worldBounds, centre - spacingOffset, offset, pointSpacing);
 
         triangleBuffer.SetCounterValue(0);
         shader.SetBuffer(0, "points", pointsBuffer);
         shader.SetBuffer(0, "triangles", triangleBuffer);
-        shader.SetInt("numPointsPerAxis", numPointsPerAxis);
+        shader.SetInt("numPointsPerAxis", numPointsPerAxisLOD);
         shader.SetFloat("isoLevel", isoLevel);
         shader.SetFloat("spacing", pointSpacing);
 
@@ -266,11 +316,10 @@ public class MeshGenerator : MonoBehaviour
 
     public void UpdateAllChunks()
     {
-
         // Create mesh for each chunk
         foreach (Chunk chunk in chunks)
         {
-            UpdateChunkMesh(chunk);
+            UpdateChunkMesh(chunk, defaultLOD);
         }
     }
 
@@ -453,8 +502,26 @@ public class MeshGenerator : MonoBehaviour
             List<Chunk> chunks = (this.chunks == null) ? new List<Chunk>(FindObjectsOfType<Chunk>()) : this.chunks;
             foreach (var chunk in chunks)
             {
+                if (chunk.coord.y != 0) continue;
+
                 Bounds bounds = new Bounds(CentreFromCoord(chunk.coord), Vector3.one * boundsSize);
-                Gizmos.color = boundsGizmoCol;
+                //Gizmos.color = boundsGizmoCol;
+                //float val = 1f - chunk.lod.Distance / viewDistance;
+                //Gizmos.color = new Color(val, val, val);
+                switch (chunk.lod.name) {
+                    case "High":
+                        Gizmos.color = Color.red;
+                        break;
+                    case "Medium":
+                        Gizmos.color = Color.green;
+                        break;
+                    case "Low":
+                        Gizmos.color = Color.blue;
+                        break;
+                    default:
+                        Gizmos.color = Color.magenta;
+                        break;
+                }
                 Gizmos.DrawWireCube(CentreFromCoord(chunk.coord), Vector3.one * boundsSize);
             }
         }

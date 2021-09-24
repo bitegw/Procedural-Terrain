@@ -7,6 +7,7 @@ public class Chunk : MonoBehaviour {
 
     [HideInInspector]
     public Mesh mesh;
+    public ChunkLOD lod;
 
     MeshFilter meshFilter;
     MeshRenderer meshRenderer;
@@ -62,5 +63,53 @@ public class Chunk : MonoBehaviour {
         }
 
         meshRenderer.material = mat;
+    }
+}
+
+[System.Serializable]
+public class ChunkLOD
+{
+    public string name;
+    public int step;
+
+    [SerializeField]
+    private float distance;
+
+    public float Distance {
+        get => distance;
+        set {
+            distance = value;
+            UpdateSqrDst();
+        }
+    }
+
+    public void UpdateSqrDst()
+    {
+        SqrDst = distance * distance;
+    }
+
+    public float SqrDst { get; private set; }
+
+    public ChunkLOD(string _name, int _step, float _distance)
+    {
+        name = _name;
+        step = _step;
+        distance = _distance;
+        SqrDst = distance * distance;
+    }
+
+    public bool Equals(ChunkLOD other)
+    {
+        return (step == other.step && distance == other.distance);
+    }
+
+    public static bool operator ==(ChunkLOD a, ChunkLOD b)
+    {
+        return a.Equals(b);
+    }
+
+    public static bool operator != (ChunkLOD a, ChunkLOD b)
+    {
+        return !a.Equals(b);
     }
 }
